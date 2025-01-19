@@ -1,7 +1,7 @@
 import torch
 
 # from bitsandbytes.triton.triton_utils import is_triton_available
-from triton_utils import is_triton_available
+from bnbtriton.triton_utils import is_triton_available
 
 
 

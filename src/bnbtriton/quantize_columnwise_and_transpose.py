@@ -2,7 +2,7 @@ import math
 
 import torch
 
-from bitsandbytes.triton.triton_utils import is_triton_available
+from bnbtriton.triton_utils import is_triton_available
 
 if not is_triton_available():
 
