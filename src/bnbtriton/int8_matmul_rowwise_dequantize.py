@@ -13,7 +13,7 @@ else:
     import triton
     import triton.language as tl
 
-    from matmul_perf_model import early_config_prune, estimate_matmul_time
+    from bnbtriton.matmul_perf_model import early_config_prune, estimate_matmul_time
 
     # This is a matmul kernel based on triton.ops.matmul
     # It is modified to support rowwise quantized input and columnwise quantized weight
