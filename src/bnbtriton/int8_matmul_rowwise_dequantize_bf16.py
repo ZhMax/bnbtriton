@@ -7,7 +7,7 @@ from bnbtriton.triton_utils import is_triton_available
 
 if not is_triton_available():
 
-    def int8_matmul_rowwise_dequantize(a, b, state_x, state_w, bias):
+    def int8_matmul_rowwise_dequantize_bf16(a, b, state_x, state_w, bias):
         return None
 else:
     import triton
@@ -49,6 +49,8 @@ else:
                             )
         return configs
 
+
+
     @triton.autotune(
         configs=[
             # basic configs for compute-bound matmuls
@@ -76,13 +78,8 @@ else:
         key=["M", "N", "K"],
         prune_configs_by={"early_config_prune": early_config_prune, "perf_model": estimate_matmul_time, "top_k": 10},
     )
-    @triton.heuristics(
-        {
-            "EVEN_K": lambda args: args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0,
-        },
-    )
     @triton.jit
-    def _int8_matmul_rowwise_dequantize(
+    def _int8_matmul_rowwise_dequantize_bf16(
         A,
         B,
         C,
@@ -105,12 +102,12 @@ else:
         BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
         SPLIT_K: tl.constexpr,
-        EVEN_K: tl.constexpr,
+        # EVEN_K: tl.constexpr,
         ACC_TYPE: tl.constexpr,
     ):
         # matrix multiplication
         pid = tl.program_id(0)
-        pid_z = tl.program_id(1)
+        # pid_z = tl.program_id(1)
         grid_m = tl.cdiv(M, BLOCK_M)
         grid_n = tl.cdiv(N, BLOCK_N)
         # re-order program ID for better L2 performance
@@ -124,7 +121,8 @@ else:
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
         rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-        rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+        # rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+        rk = tl.arange(0, BLOCK_K)
         # pointers
         A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
         B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
@@ -144,34 +142,57 @@ else:
 
 
         # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+        # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        # for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+        #     if EVEN_K:
+        #         a = tl.load(A)
+        #         b = tl.load(B)
+        #     else:
+        #         k_remaining = K - k * (BLOCK_K * SPLIT_K)
+        #         a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.0)
+        #         b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.0)
+        #     acc += tl.dot(a, b)
+        #     A += BLOCK_K * SPLIT_K * stride_ak
+        #     B += BLOCK_K * SPLIT_K * stride_bk
+
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-        for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
-            if EVEN_K:
-                a = tl.load(A)
-                b = tl.load(B)
-            else:
-                k_remaining = K - k * (BLOCK_K * SPLIT_K)
-                a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.0)
-                b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.0)
+        # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            k_remaining = K - k * BLOCK_K
+            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.0)
+            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.0)
             acc += tl.dot(a, b)
-            A += BLOCK_K * SPLIT_K * stride_ak
-            B += BLOCK_K * SPLIT_K * stride_bk
+            # acc += w_factor * (x_factor * (tl.dot(a, b) * divfactor).to(tl.bfloat16))
+            A += BLOCK_K * stride_ak
+            B += BLOCK_K * stride_bk        
 
         acc = w_factor * (x_factor * (acc * divfactor))
+        # acc = (w_factor * (x_factor * acc)) * divfactor
         acc = acc.to(C.dtype.element_ty)
 
+        # acc = (w_factor * x_factor * divfactor.to(tl.float16)) * acc
+        # acc = w_factor * (x_factor * acc)
+        
         if has_bias:
-            bias = tl.load(bias + rn, rn < N).to(C.dtype.element_ty)
+            # bias = tl.load(bias + rn, rn < N).to(C.dtype.element_ty)
+            bias = tl.load(bias + rn, rn < N)
             acc = acc + bias[None, :]
 
         C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
         mask = (rm < M)[:, None] & (rn < N)[None, :]
         # handles write-back with reduction-splitting
-        if SPLIT_K == 1:
-            tl.store(C, acc, mask=mask)
-        else:
-            tl.atomic_add(C, acc, mask=mask)
+        # if SPLIT_K == 1:
+        #     tl.store(C, acc, mask=mask)
+        # else:
+        #     tl.atomic_add(C, acc, mask=mask)
 
+        tl.store(C, acc, mask=mask)
+
+
+    # @triton.autotune(
+    #     configs=[triton.Config({"BLOCK_M": 16, "BLOCK_N": 32, "BLOCK_K": 256, "SPLIT_K": 1}, num_stages=8, num_warps=4)],
+    #     key=["M", "N", "K"]
+    # )
 
     @triton.autotune(
         configs=[
@@ -200,13 +221,8 @@ else:
         key=["M", "N", "K"],
         prune_configs_by={"early_config_prune": early_config_prune, "perf_model": estimate_matmul_time, "top_k": 10},
     )
-    @triton.heuristics(
-        {
-            "EVEN_K": lambda args: args["K"] % (args["BLOCK_K"] * args["SPLIT_K"]) == 0,
-        },
-    )
     @triton.jit
-    def _int8_large_matmul_rowwise_dequantize(
+    def _int8_large_matmul_rowwise_dequantize_bf16(
         A,
         B,
         C,
@@ -229,12 +245,12 @@ else:
         BLOCK_K: tl.constexpr,
         GROUP_M: tl.constexpr,
         SPLIT_K: tl.constexpr,
-        EVEN_K: tl.constexpr,
+        # EVEN_K: tl.constexpr,
         ACC_TYPE: tl.constexpr,
     ):
         # matrix multiplication
         pid = tl.program_id(0).to(tl.int64)
-        pid_z = tl.program_id(1)
+        # pid_z = tl.program_id(1)
         grid_m = tl.cdiv(M, BLOCK_M)
         grid_n = tl.cdiv(N, BLOCK_N)
         # re-order program ID for better L2 performance
@@ -248,7 +264,8 @@ else:
         rn = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
         ram = tl.max_contiguous(tl.multiple_of(rm % M, BLOCK_M), BLOCK_M)
         rbn = tl.max_contiguous(tl.multiple_of(rn % N, BLOCK_N), BLOCK_N)
-        rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+        # rk = pid_z * BLOCK_K + tl.arange(0, BLOCK_K)
+        rk = tl.arange(0, BLOCK_K)
         # pointers
         A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
         B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
@@ -268,37 +285,56 @@ else:
 
 
         # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
+        # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        # for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
+        #     if EVEN_K:
+        #         a = tl.load(A)
+        #         b = tl.load(B)
+        #     else:
+        #         k_remaining = K - k * (BLOCK_K * SPLIT_K)
+        #         a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.0)
+        #         b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.0)
+        #     acc += tl.dot(a, b)
+        #     A += BLOCK_K * SPLIT_K * stride_ak
+        #     B += BLOCK_K * SPLIT_K * stride_bk
+
         acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
-        for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
-            if EVEN_K:
-                a = tl.load(A)
-                b = tl.load(B)
-            else:
-                k_remaining = K - k * (BLOCK_K * SPLIT_K)
-                a = tl.load(A, mask=rk[None, :] < k_remaining, other=0.0)
-                b = tl.load(B, mask=rk[:, None] < k_remaining, other=0.0)
+        # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.bfloat16)
+        for k in range(0, tl.cdiv(K, BLOCK_K)):
+            k_remaining = K - k * BLOCK_K
+            a = tl.load(A, mask=rk[None, :] < k_remaining, other=0)
+            b = tl.load(B, mask=rk[:, None] < k_remaining, other=0)
             acc += tl.dot(a, b)
-            A += BLOCK_K * SPLIT_K * stride_ak
-            B += BLOCK_K * SPLIT_K * stride_bk
+            # acc += w_factor * (x_factor * (tl.dot(a, b) * divfactor).to(tl.bfloat16))
+            A += BLOCK_K * stride_ak
+            B += BLOCK_K * stride_bk        
 
         acc = w_factor * (x_factor * (acc * divfactor))
+        # acc = (w_factor * (x_factor * acc)) * divfactor
         acc = acc.to(C.dtype.element_ty)
+        
+        # acc = (w_factor * x_factor * divfactor.to(tl.float16)) * acc
+        # acc = w_factor * (x_factor * acc)
 
         if has_bias:
-            bias = tl.load(bias + rn, rn < N).to(C.dtype.element_ty)
+            # bias = tl.load(bias + rn, rn < N).to(C.dtype.element_ty)
+            bias = tl.load(bias + rn, rn < N)
             acc = acc + bias[None, :]
 
         C = C + (rm[:, None] * stride_cm + rn[None, :] * stride_cn)
         mask = (rm < M)[:, None] & (rn < N)[None, :]
         # handles write-back with reduction-splitting
-        if SPLIT_K == 1:
-            tl.store(C, acc, mask=mask)
-        else:
-            tl.atomic_add(C, acc, mask=mask)
+        # if SPLIT_K == 1:
+        #     tl.store(C, acc, mask=mask)
+        # else:
+        #     tl.atomic_add(C, acc, mask=mask)
+
+        tl.store(C, acc, mask=mask)
 
 
-    def int8_matmul_rowwise_dequantize(a, b, state_x, state_w, bias):
+    def int8_matmul_rowwise_dequantize_bf16(a, b, state_x, state_w, bias):
         divfactor = 1.0 / (127.0 * 127.0)
+        # divfactor = None
 
         has_bias = 0 if bias is None else 1
 
@@ -313,7 +349,7 @@ else:
         M, K = a.shape
         _, N = b.shape
         # allocates output
-        c = torch.empty((M, N), device=device, dtype=torch.float16)
+        c = torch.empty((M, N), device=device, dtype=torch.bfloat16)
         # accumulator types
         ACC_TYPE = tl.float32  # if a.dtype in [torch.float16, torch.bfloat16, torch.float32] else tl.int32
         # launch int8_matmul_rowwise_dequantize kernel
@@ -321,7 +357,7 @@ else:
 
         if M * N < 2147483648:
 
-            _int8_matmul_rowwise_dequantize[grid](
+            _int8_matmul_rowwise_dequantize_bf16[grid](
                 a,
                 b,
                 c,
@@ -345,7 +381,7 @@ else:
 
         else:
 
-            _int8_large_matmul_rowwise_dequantize[grid](
+            _int8_large_matmul_rowwise_dequantize_bf16[grid](
                 a,
                 b,
                 c,

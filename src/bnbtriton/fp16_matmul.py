@@ -82,17 +82,14 @@ else:
         },
     )
     @triton.jit
-    def _int8_matmul_rowwise_dequantize(
+    def _fp16_matmul(
         A,
         B,
         C,
         bias,
-        state_x_ptr,
-        state_w_ptr,
         M,
         N,
         K,
-        divfactor,
         has_bias: tl.constexpr,
         stride_am,
         stride_ak,
@@ -129,9 +126,6 @@ else:
         A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
         B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
-        w_factor = tl.load(state_w_ptr + rbn, mask=rbn < N)[None, :]
-        x_factor = tl.load(state_x_ptr + ram, mask=ram < M)[:, None]
-
         # w_factor = tl.load(state_w_ptr + rn, mask=rn < N)[None, :]
         # x_factor = tl.load(state_x_ptr + rm, mask=rm < M)[:, None]
 
@@ -144,7 +138,7 @@ else:
 
 
         # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
             if EVEN_K:
                 a = tl.load(A)
@@ -157,7 +151,6 @@ else:
             A += BLOCK_K * SPLIT_K * stride_ak
             B += BLOCK_K * SPLIT_K * stride_bk
 
-        acc = w_factor * (x_factor * (acc * divfactor))
         acc = acc.to(C.dtype.element_ty)
 
         if has_bias:
@@ -206,17 +199,14 @@ else:
         },
     )
     @triton.jit
-    def _int8_large_matmul_rowwise_dequantize(
+    def _fp16_large_matmul(
         A,
         B,
         C,
         bias,
-        state_x_ptr,
-        state_w_ptr,
         M,
         N,
         K,
-        divfactor,
         has_bias: tl.constexpr,
         stride_am,
         stride_ak,
@@ -253,9 +243,6 @@ else:
         A = A + (ram[:, None] * stride_am + rk[None, :] * stride_ak)
         B = B + (rk[:, None] * stride_bk + rbn[None, :] * stride_bn)
 
-        w_factor = tl.load(state_w_ptr + rbn, mask=rbn < N)[None, :]
-        x_factor = tl.load(state_x_ptr + ram, mask=ram < M)[:, None]
-
         # w_factor = tl.load(state_w_ptr + rn, mask=rn < N)[None, :]
         # x_factor = tl.load(state_x_ptr + rm, mask=rm < M)[:, None]
 
@@ -268,7 +255,7 @@ else:
 
 
         # acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=ACC_TYPE)
-        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.int32)
+        acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
         for k in range(0, tl.cdiv(K, BLOCK_K * SPLIT_K)):
             if EVEN_K:
                 a = tl.load(A)
@@ -280,8 +267,7 @@ else:
             acc += tl.dot(a, b)
             A += BLOCK_K * SPLIT_K * stride_ak
             B += BLOCK_K * SPLIT_K * stride_bk
-
-        acc = w_factor * (x_factor * (acc * divfactor))
+            
         acc = acc.to(C.dtype.element_ty)
 
         if has_bias:
@@ -297,8 +283,7 @@ else:
             tl.atomic_add(C, acc, mask=mask)
 
 
-    def int8_matmul_rowwise_dequantize(a, b, state_x, state_w, bias):
-        divfactor = 1.0 / (127.0 * 127.0)
+    def fp16_matmul(a, b, bias):
 
         has_bias = 0 if bias is None else 1
 
@@ -321,17 +306,14 @@ else:
 
         if M * N < 2147483648:
 
-            _int8_matmul_rowwise_dequantize[grid](
+            _fp16_matmul[grid](
                 a,
                 b,
                 c,
                 bias,
-                state_x,
-                state_w,
                 M,
                 N,
                 K,
-                divfactor,
                 has_bias,
                 a.stride(0),
                 a.stride(1),
@@ -345,17 +327,14 @@ else:
 
         else:
 
-            _int8_large_matmul_rowwise_dequantize[grid](
+            _fp16_large_matmul[grid](
                 a,
                 b,
                 c,
                 bias,
-                state_x,
-                state_w,
                 M,
                 N,
                 K,
-                divfactor,
                 has_bias,
                 a.stride(0),
                 a.stride(1),
